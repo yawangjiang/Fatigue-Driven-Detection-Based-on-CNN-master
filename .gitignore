@@ -13,3 +13,10 @@ __pycache__/
 
 *.log
 tested/
+
+dataset/
+legacy/
+weights/
+result.jpg
+test.jpg
+test_done.jpg

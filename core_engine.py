@@ -95,42 +95,62 @@ def init_landmark_tracker():
 
 
 class FatigueEvaluator:
-    """疲劳评估器，使用加权系统和阈值判断"""
+    """Fatigue evaluator based on sliding-window temporal features."""
 
     def __init__(self):
-        # 权重配置
         self.weights = {
-            'perclos': 0.5,  # PERCLOS权重
-            'blink': 0.3,  # 眨眼权重
-            'yawn': 0.5  # 哈欠权重
+            'perclos': 0.4,
+            'blink': 0.2,
+            'yawn': 0.25,
+            'eye_closure': 0.3,
+            'mouth_duration': 0.2,
         }
-        # 疲劳阈值 (加权总分超过此值判定为疲劳)
         self.fatigue_threshold = 0.4
-        # 指标阈值
-        self.perclos_threshold = 0.2  # PERCLOS阈值
-        self.blink_threshold = (0.2, 0.8)  # 眨眼频率正常范围(次/秒)
-        self.yawn_threshold = 1  # 哈欠次数阈值(5秒内)
+        self.perclos_threshold = 0.2
+        self.blink_threshold = (0.2, 0.8)
+        self.yawn_threshold = 2
+        self.eye_closure_threshold = 1.5
+        self.yawn_duration_threshold = 2.0
 
-    def evaluate(self, perclos, blink_rate, yawn_count):
-        """评估疲劳状态，返回加权分数和是否疲劳"""
-        # 计算各项指标的分数(0-1)
+    def evaluate(self, perclos, blink_rate, yawn_count, window_features=None):
+        """Return a fatigue score using recent 30-60s temporal features."""
+        window_features = window_features or {}
+        perclos = window_features.get("perclos", perclos)
+        blink_rate = window_features.get("blink_rate", blink_rate)
+        yawn_count = window_features.get("yawn_count", yawn_count)
+        longest_eye_closure = max(
+            window_features.get("longest_eye_closure", 0.0),
+            window_features.get("current_eye_closure", 0.0),
+        )
+        max_yawn_duration = max(
+            window_features.get("max_yawn_duration", 0.0),
+            window_features.get("current_yawn_duration", 0.0),
+        )
+
         perclos_score = min(perclos / self.perclos_threshold, 1.0)
 
-        # 眨眼频率异常检测
-        if blink_rate < self.blink_threshold[0]:  # 眨眼过少
+        if blink_rate < self.blink_threshold[0]:
             blink_score = (self.blink_threshold[0] - blink_rate) / self.blink_threshold[0]
-        elif blink_rate > self.blink_threshold[1]:  # 眨眼过多
+        elif blink_rate > self.blink_threshold[1]:
             blink_score = (blink_rate - self.blink_threshold[1]) / (2 - self.blink_threshold[1])
         else:
             blink_score = 0
-        # 哈欠次数
+
         yawn_score = min(yawn_count / self.yawn_threshold, 1.0)
-        # 计算加权总分
+        eye_closure_score = min(longest_eye_closure / self.eye_closure_threshold, 1.0)
+        mouth_duration_score = min(max_yawn_duration / self.yawn_duration_threshold, 1.0)
+
         total_score = (self.weights['perclos'] * perclos_score +
                        self.weights['blink'] * blink_score +
-                       self.weights['yawn'] * yawn_score)
+                       self.weights['yawn'] * yawn_score +
+                       self.weights['eye_closure'] * eye_closure_score +
+                       self.weights['mouth_duration'] * mouth_duration_score)
 
-        is_fatigue = total_score >= self.fatigue_threshold
+        is_fatigue = (
+            total_score >= self.fatigue_threshold
+            or longest_eye_closure >= self.eye_closure_threshold
+            or max_yawn_duration >= self.yawn_duration_threshold
+        )
 
         return {
             'fatigue': is_fatigue,
@@ -138,6 +158,9 @@ class FatigueEvaluator:
             'perclos': perclos,
             'blink_rate': blink_rate,
             'yawn_count': yawn_count,
+            'longest_eye_closure': longest_eye_closure,
+            'max_yawn_duration': max_yawn_duration,
+            'window_features': window_features,
             'weights': self.weights
         }
 
@@ -232,7 +255,8 @@ class ContinuousFatigueDetectionThread(BaseDetectionThread):
                     perclos = landmark_status["perclos"]
                     blink_rate = landmark_status["blink_rate"]
                     yawn_count = landmark_status["yawn_count"]
-                    result = self.evaluator.evaluate(perclos, blink_rate, yawn_count)
+                    window_features = landmark_status.get("window_features", {})
+                    result = self.evaluator.evaluate(perclos, blink_rate, yawn_count, window_features)
                     status_info = {
                         "perclos": perclos,
                         "blink_count": landmark_status["blink_count"],
@@ -240,6 +264,9 @@ class ContinuousFatigueDetectionThread(BaseDetectionThread):
                         "yawn_count": yawn_count,
                         "score": result['score'],
                         "fatigue": result['fatigue'],
+                        "longest_eye_closure": result["longest_eye_closure"],
+                        "max_yawn_duration": result["max_yawn_duration"],
+                        "window_features": window_features,
                         "eye_state": landmark_status["eye_state"],
                         "mouth_state": landmark_status["mouth_state"],
                         "fatigue_features": landmark_status["fatigue_features"],
@@ -256,6 +283,7 @@ class ContinuousFatigueDetectionThread(BaseDetectionThread):
                     "blink_count": landmark_status["blink_count"],
                     "blink_rate": 0,
                     "yawn_count": landmark_status["yawn_count"],
+                    "window_features": landmark_status.get("window_features", {}),
                     "score": 0,
                     "fatigue": False,
                     "eye_state": landmark_status["eye_state"],
@@ -743,6 +771,7 @@ class FatigueCheckInThread(BaseDetectionThread):
         self.tts_engine = init_tts_engine()
         self.database_file = os.path.join(ROOT, "traditional_features.pkl")
         self.landmark_tracker = init_landmark_tracker()
+        self.latest_window_features = {}
 
         self.database_features = self.load_or_build_database(os.path.join(ROOT, "dataset", "data"))
 
@@ -981,8 +1010,10 @@ class FatigueCheckInThread(BaseDetectionThread):
                     self.total_frames = self.landmark_tracker.total_frames
                     self.blink_count = self.landmark_tracker.blink_count
                     self.yawn_count = self.landmark_tracker.yawn_count
+                    self.latest_window_features = landmark_status.get("window_features", {})
 
                 evaluation_status = self.check_evaluation_status()
+                window_features = landmark_status.get("window_features", {})
                 status_info = {
                     "identity": self.current_identity if self.current_identity else "未检测到",
                     "evaluating": self.is_evaluating,
@@ -990,7 +1021,11 @@ class FatigueCheckInThread(BaseDetectionThread):
                     "evaluation_result": self.evaluation_result,
                     "blink_count": self.blink_count,
                     "yawn_count": self.yawn_count,
-                    "perclos": self.eye_closed_frames / max(1, self.total_frames),
+                    "perclos": window_features.get("perclos", self.eye_closed_frames / max(1, self.total_frames)),
+                    "blink_rate": window_features.get("blink_rate", 0),
+                    "longest_eye_closure": window_features.get("longest_eye_closure", 0),
+                    "max_yawn_duration": window_features.get("max_yawn_duration", 0),
+                    "window_features": window_features,
                     "eye_state": landmark_status["eye_state"],
                     "mouth_state": landmark_status["mouth_state"],
                     "confidence": best_confidence,
@@ -1121,6 +1156,7 @@ class FatigueCheckInThread(BaseDetectionThread):
         self.yawn_count = 0
         self.last_blink_time = None
         self.last_yawn_time = None
+        self.latest_window_features = {}
 
     def update_face_detection(self):
         """更新人脸检测时间"""
@@ -1190,14 +1226,17 @@ class FatigueCheckInThread(BaseDetectionThread):
         yawn_count = self.yawn_count  # 5秒内哈欠次数
 
         # 使用评估器判断疲劳状态
-        result = self.evaluator.evaluate(perclos, blink_rate, yawn_count)
+        result = self.evaluator.evaluate(perclos, blink_rate, yawn_count, self.latest_window_features)
         self.evaluation_result = {
             "identity": self.current_identity,
             "fatigue": result['fatigue'],
             "score": result['score'],
-            "perclos": perclos,
-            "blink_rate": blink_rate,
-            "yawn_count": yawn_count,
+            "perclos": result['perclos'],
+            "blink_rate": result['blink_rate'],
+            "yawn_count": result['yawn_count'],
+            "longest_eye_closure": result["longest_eye_closure"],
+            "max_yawn_duration": result["max_yawn_duration"],
+            "window_features": result["window_features"],
             "weights": result['weights']
         }
 

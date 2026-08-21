@@ -16,6 +16,7 @@ except ImportError:  # pragma: no cover - runtime fallback for missing optional 
 class LandmarkFatigueConfig:
     ear_threshold: float = 0.21
     mar_threshold: float = 0.56
+    window_seconds: float = 60.0
     min_blink_frames: int = 2
     min_yawn_frames: int = 6
     yawn_cooldown_seconds: float = 1.5
@@ -54,7 +55,15 @@ class LandmarkFatigueTracker:
         self.eye_was_closed = False
         self.yawn_active = False
         self.last_yawn_time = None
-        self.recent_eye_states = deque(maxlen=300)
+        self._closed_start_time = None
+        self._mouth_open_start_time = None
+        self._last_longest_eye_closure = 0.0
+        self._last_yawn_duration = 0.0
+        self.frame_window = deque()
+        self.blink_events = deque()
+        self.yawn_events = deque()
+        self.eye_closure_events = deque()
+        self.yawn_duration_events = deque()
 
     def close(self):
         self.face_mesh.close()
@@ -94,15 +103,18 @@ class LandmarkFatigueTracker:
         results = self.face_mesh.process(rgb)
 
         if not results.multi_face_landmarks:
+            window_features = self.window_features
             return {
                 "face_found": False,
                 "eye_state": "未检测到人脸",
                 "mouth_state": "未检测到人脸",
                 "ear": None,
                 "mar": None,
-                "perclos": self.perclos,
+                "perclos": window_features["perclos"],
                 "blink_count": self.blink_count,
-                "yawn_count": self.yawn_count,
+                "blink_rate": window_features["blink_rate"],
+                "yawn_count": window_features["yawn_count"],
+                "window_features": window_features,
             }
 
         landmarks = results.multi_face_landmarks[0].landmark
@@ -115,7 +127,9 @@ class LandmarkFatigueTracker:
         mouth_open = mar > self.config.mar_threshold
 
         if update:
-            self._update_counts(eye_closed, mouth_open)
+            self._update_counts(eye_closed, mouth_open, ear, mar)
+
+        window_features = self.window_features
 
         if draw:
             self._draw_status(frame, landmarks, width, height, ear, mar, eye_closed, mouth_open)
@@ -128,14 +142,17 @@ class LandmarkFatigueTracker:
             "mouth_state": f"MAR: {mar:.2f} ({'张开' if mouth_open else '闭合'})",
             "ear": ear,
             "mar": mar,
-            "perclos": self.perclos,
+            "perclos": window_features["perclos"],
             "blink_count": self.blink_count,
-            "blink_rate": self.blink_count / max(time.time() - self.start_time, 1.0),
-            "yawn_count": self.yawn_count,
+            "blink_rate": window_features["blink_rate"],
+            "yawn_count": window_features["yawn_count"],
+            "window_features": window_features,
             "fatigue_features": [
                 f"EAR={ear:.2f}",
                 f"MAR={mar:.2f}",
-                f"PERCLOS={self.perclos:.2f}",
+                f"PERCLOS={window_features['perclos']:.2f}",
+                f"LongestEyeClose={window_features['longest_eye_closure']:.1f}s",
+                f"YawnDuration={window_features['max_yawn_duration']:.1f}s",
             ],
         }
 
@@ -147,23 +164,77 @@ class LandmarkFatigueTracker:
 
     @property
     def perclos(self):
-        return self.eye_closed_frames / max(1, self.total_frames)
+        return self.window_features["perclos"]
 
-    def _update_counts(self, eye_closed, mouth_open):
+    @property
+    def window_features(self):
+        self._prune_windows(time.time())
+        frame_count = len(self.frame_window)
+        closed_count = sum(1 for item in self.frame_window if item["eye_closed"])
+        mouth_open_count = sum(1 for item in self.frame_window if item["mouth_open"])
+        ears = [item["ear"] for item in self.frame_window if item["ear"] is not None]
+        mars = [item["mar"] for item in self.frame_window if item["mar"] is not None]
+        window_span = self._window_span_seconds()
+        current_eye_closure = self._current_duration(self._closed_start_time)
+        current_yawn_duration = self._current_duration(self._mouth_open_start_time)
+        longest_eye_closure = max(
+            [duration for _, duration in self.eye_closure_events] + [current_eye_closure, 0.0]
+        )
+        max_yawn_duration = max(
+            [duration for _, duration in self.yawn_duration_events] + [current_yawn_duration, 0.0]
+        )
+        return {
+            "window_seconds": self.config.window_seconds,
+            "active_window_seconds": window_span,
+            "frame_count": frame_count,
+            "perclos": closed_count / max(1, frame_count),
+            "blink_count": len(self.blink_events),
+            "blink_rate": len(self.blink_events) / max(window_span, 1.0),
+            "yawn_count": len(self.yawn_events),
+            "mouth_open_ratio": mouth_open_count / max(1, frame_count),
+            "longest_eye_closure": longest_eye_closure,
+            "current_eye_closure": current_eye_closure,
+            "max_yawn_duration": max_yawn_duration,
+            "current_yawn_duration": current_yawn_duration,
+            "ear_mean": float(np.mean(ears)) if ears else None,
+            "ear_min": float(np.min(ears)) if ears else None,
+            "mar_mean": float(np.mean(mars)) if mars else None,
+            "mar_max": float(np.max(mars)) if mars else None,
+        }
+
+    def _update_counts(self, eye_closed, mouth_open, ear=None, mar=None):
+        now = time.time()
         self.total_frames += 1
+        self.frame_window.append({
+            "time": now,
+            "eye_closed": eye_closed,
+            "mouth_open": mouth_open,
+            "ear": ear,
+            "mar": mar,
+        })
+
         if eye_closed:
             self.eye_closed_frames += 1
             self.closed_streak += 1
             self.eye_was_closed = True
+            if self._closed_start_time is None:
+                self._closed_start_time = now
         else:
+            if self._closed_start_time is not None:
+                duration = now - self._closed_start_time
+                self._last_longest_eye_closure = max(self._last_longest_eye_closure, duration)
+                self.eye_closure_events.append((now, duration))
+                self._closed_start_time = None
             if self.eye_was_closed and self.closed_streak >= self.config.min_blink_frames:
                 self.blink_count += 1
+                self.blink_events.append(now)
             self.closed_streak = 0
             self.eye_was_closed = False
 
         if mouth_open:
             self.mouth_open_streak += 1
-            now = time.time()
+            if self._mouth_open_start_time is None:
+                self._mouth_open_start_time = now
             enough_frames = self.mouth_open_streak >= self.config.min_yawn_frames
             cooled_down = (
                 self.last_yawn_time is None
@@ -172,10 +243,39 @@ class LandmarkFatigueTracker:
             if enough_frames and not self.yawn_active and cooled_down:
                 self.yawn_count += 1
                 self.last_yawn_time = now
+                self.yawn_events.append(now)
                 self.yawn_active = True
         else:
+            if self._mouth_open_start_time is not None:
+                duration = now - self._mouth_open_start_time
+                self._last_yawn_duration = max(self._last_yawn_duration, duration)
+                self.yawn_duration_events.append((now, duration))
+                self._mouth_open_start_time = None
             self.mouth_open_streak = 0
             self.yawn_active = False
+        self._prune_windows(now)
+
+    def _prune_windows(self, now):
+        cutoff = now - self.config.window_seconds
+        while self.frame_window and self.frame_window[0]["time"] < cutoff:
+            self.frame_window.popleft()
+        while self.blink_events and self.blink_events[0] < cutoff:
+            self.blink_events.popleft()
+        while self.yawn_events and self.yawn_events[0] < cutoff:
+            self.yawn_events.popleft()
+        while self.eye_closure_events and self.eye_closure_events[0][0] < cutoff:
+            self.eye_closure_events.popleft()
+        while self.yawn_duration_events and self.yawn_duration_events[0][0] < cutoff:
+            self.yawn_duration_events.popleft()
+
+    def _window_span_seconds(self):
+        if len(self.frame_window) < 2:
+            return min(max(time.time() - self.start_time, 1.0), self.config.window_seconds)
+        return max(self.frame_window[-1]["time"] - self.frame_window[0]["time"], 1.0)
+
+    @staticmethod
+    def _current_duration(start_time):
+        return 0.0 if start_time is None else time.time() - start_time
 
     def _draw_status(self, frame, landmarks, width, height, ear, mar, eye_closed, mouth_open):
         for idx in self.LEFT_EYE + self.RIGHT_EYE + self.MOUTH_HORIZONTAL:
@@ -190,4 +290,6 @@ class LandmarkFatigueTracker:
         mouth_color = (0, 0, 255) if mouth_open else (0, 220, 0)
         cv2.putText(frame, f"EAR {ear:.2f}", (18, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.7, eye_color, 2)
         cv2.putText(frame, f"MAR {mar:.2f}", (18, 62), cv2.FONT_HERSHEY_SIMPLEX, 0.7, mouth_color, 2)
-        cv2.putText(frame, f"PERCLOS {self.perclos:.2f}", (18, 92), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
+        features = self.window_features
+        cv2.putText(frame, f"PERCLOS {features['perclos']:.2f}", (18, 92), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
+        cv2.putText(frame, f"Close {features['longest_eye_closure']:.1f}s", (18, 122), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
