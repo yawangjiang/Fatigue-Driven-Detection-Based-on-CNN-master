@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+*.pyo
+
+.venv/
+.idea/
+
+*.pth
+*.pt
+*.caffemodel
+*.pkl
+*.npy
+
+*.log
+tested/
