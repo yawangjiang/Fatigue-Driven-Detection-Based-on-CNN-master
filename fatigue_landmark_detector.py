@@ -1,5 +1,6 @@
 from collections import deque
 from dataclasses import dataclass
+import math
 import time
 
 import cv2
@@ -16,6 +17,8 @@ except ImportError:  # pragma: no cover - runtime fallback for missing optional 
 class LandmarkFatigueConfig:
     ear_threshold: float = 0.21
     mar_threshold: float = 0.56
+    eye_closed_probability_threshold: float = 0.80
+    mouth_open_probability_threshold: float = 0.70
     window_seconds: float = 60.0
     min_blink_frames: int = 2
     min_yawn_frames: int = 6
@@ -31,10 +34,26 @@ class LandmarkFatigueTracker:
     MOUTH_HORIZONTAL = (61, 291)
     MOUTH_VERTICAL = ((13, 14), (81, 178), (312, 402))
 
-    def __init__(self, config=None, max_faces=1):
+    # Crop geometry matches the FatigueSense classifier training pipeline.
+    MODEL_LEFT_EYE = (33, 133, 160, 159, 158, 144, 145, 153)
+    MODEL_RIGHT_EYE = (362, 263, 387, 386, 385, 373, 374, 380)
+    MODEL_MOUTH = (61, 291, 81, 178, 13, 14, 402, 311, 308)
+    LEFT_EYE_OUTER_CORNER = 33
+    RIGHT_EYE_OUTER_CORNER = 263
+    MODEL_INPUT_SIZE = (64, 64)
+    EYE_BOX_W_RATIO = 0.50
+    EYE_BOX_H_RATIO = 0.35
+    MOUTH_LANDMARK_W_SCALE = 1.6
+    MOUTH_LANDMARK_H_SCALE = 2.5
+    MOUTH_BOX_H_RATIO = 0.70
+    MOUTH_VERTICAL_OFFSET_RATIO = 0.20
+
+    def __init__(self, config=None, max_faces=1, state_classifier=None):
         if mp is None:
             raise RuntimeError("mediapipe is not installed")
         self.config = config or LandmarkFatigueConfig()
+        self.state_classifier = state_classifier
+        self.classifier_error = None
         self.face_mesh = mp.solutions.face_mesh.FaceMesh(
             static_image_mode=False,
             max_num_faces=max_faces,
@@ -96,6 +115,157 @@ class LandmarkFatigueTracker:
             vertical_values.append(self._distance(top, bottom))
         return float(np.mean(vertical_values) / (horizontal + 1e-6))
 
+    def _region_center(self, landmarks, indices, width, height):
+        points = [
+            self._point(landmarks, index, width, height).astype(np.int32)
+            for index in indices
+        ]
+        center = np.mean(points, axis=0)
+        return int(center[0]), int(center[1])
+
+    @staticmethod
+    def _crop_aligned_box(frame, center, angle_deg, box_width, box_height):
+        """Rotate around a facial region and return a 64x64 BGR crop."""
+        frame_height, frame_width = frame.shape[:2]
+        center_x, center_y = center
+        matrix = cv2.getRotationMatrix2D(
+            (float(center_x), float(center_y)), -angle_deg, 1.0
+        )
+        rotated = cv2.warpAffine(
+            frame,
+            matrix,
+            (frame_width, frame_height),
+            flags=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_REPLICATE,
+        )
+
+        x1 = max(0, int(center_x - box_width / 2))
+        y1 = max(0, int(center_y - box_height / 2))
+        x2 = min(frame_width, int(center_x + box_width / 2))
+        y2 = min(frame_height, int(center_y + box_height / 2))
+        if x2 <= x1 or y2 <= y1:
+            return None
+
+        crop = rotated[y1:y2, x1:x2]
+        if crop.size == 0:
+            return None
+        return cv2.resize(
+            crop,
+            LandmarkFatigueTracker.MODEL_INPUT_SIZE,
+            interpolation=cv2.INTER_CUBIC,
+        )
+
+    def _extract_model_crops(self, frame, landmarks, width, height):
+        left_outer = self._point(
+            landmarks, self.LEFT_EYE_OUTER_CORNER, width, height
+        ).astype(np.int32)
+        right_outer = self._point(
+            landmarks, self.RIGHT_EYE_OUTER_CORNER, width, height
+        ).astype(np.int32)
+        delta_x, delta_y = right_outer - left_outer
+        inter_eye_distance = max(1, int(math.hypot(delta_x, delta_y)))
+        roll_deg = float(np.degrees(np.arctan2(delta_y, delta_x)))
+
+        eye_box_width = int(self.EYE_BOX_W_RATIO * inter_eye_distance)
+        eye_box_height = int(self.EYE_BOX_H_RATIO * inter_eye_distance)
+        left_center = self._region_center(
+            landmarks, self.MODEL_LEFT_EYE, width, height
+        )
+        right_center = self._region_center(
+            landmarks, self.MODEL_RIGHT_EYE, width, height
+        )
+
+        mouth_points = [
+            self._point(landmarks, index, width, height).astype(np.int32)
+            for index in self.MODEL_MOUTH
+        ]
+        mouth_x = [point[0] for point in mouth_points]
+        mouth_y = [point[1] for point in mouth_points]
+        mouth_landmark_width = max(mouth_x) - min(mouth_x)
+        mouth_landmark_height = max(mouth_y) - min(mouth_y)
+        mouth_box_width = max(
+            inter_eye_distance,
+            int(self.MOUTH_LANDMARK_W_SCALE * mouth_landmark_width),
+        )
+        mouth_box_height = max(
+            int(self.MOUTH_BOX_H_RATIO * inter_eye_distance),
+            int(self.MOUTH_LANDMARK_H_SCALE * mouth_landmark_height),
+        )
+        mouth_center_x, mouth_center_y = self._region_center(
+            landmarks, self.MODEL_MOUTH, width, height
+        )
+        mouth_center_y += int(
+            self.MOUTH_VERTICAL_OFFSET_RATIO * mouth_box_height
+        )
+
+        return (
+            self._crop_aligned_box(
+                frame,
+                left_center,
+                roll_deg,
+                eye_box_width,
+                eye_box_height,
+            ),
+            self._crop_aligned_box(
+                frame,
+                right_center,
+                roll_deg,
+                eye_box_width,
+                eye_box_height,
+            ),
+            self._crop_aligned_box(
+                frame,
+                (mouth_center_x, mouth_center_y),
+                roll_deg,
+                mouth_box_width,
+                mouth_box_height,
+            ),
+        )
+
+    def _resolve_eye_mouth_state(
+        self, frame, landmarks, width, height, ear, mar
+    ):
+        fallback = {
+            "eye_closed": ear < self.config.ear_threshold,
+            "mouth_open": mar > self.config.mar_threshold,
+            "eye_closed_probability": None,
+            "mouth_open_probability": None,
+            "model_latency_ms": None,
+            "detector": "landmark_rule",
+        }
+        if self.state_classifier is None:
+            return fallback
+
+        crops = self._extract_model_crops(frame, landmarks, width, height)
+        if any(crop is None for crop in crops):
+            return fallback
+
+        try:
+            probabilities = self.state_classifier.predict(*crops)
+        except Exception as exc:
+            # Disable a broken classifier so it cannot stall every later frame.
+            self.classifier_error = str(exc)
+            self.state_classifier = None
+            print(f"预训练眼嘴模型推理失败，回退到EAR/MAR: {exc}")
+            return fallback
+
+        return {
+            "eye_closed": (
+                probabilities.mean_eye_closed
+                >= self.config.eye_closed_probability_threshold
+            ),
+            "mouth_open": (
+                probabilities.mouth_open
+                >= self.config.mouth_open_probability_threshold
+            ),
+            "eye_closed_probability": probabilities.mean_eye_closed,
+            "mouth_open_probability": probabilities.mouth_open,
+            "model_latency_ms": (
+                probabilities.eye_latency_ms + probabilities.mouth_latency_ms
+            ),
+            "detector": "pretrained_cnn",
+        }
+
     def process_frame(self, frame, update=True, draw=True):
         height, width = frame.shape[:2]
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -115,6 +285,7 @@ class LandmarkFatigueTracker:
                 "blink_rate": window_features["blink_rate"],
                 "yawn_count": window_features["yawn_count"],
                 "window_features": window_features,
+                "detector": "landmark_rule",
             }
 
         landmarks = results.multi_face_landmarks[0].landmark
@@ -123,8 +294,11 @@ class LandmarkFatigueTracker:
         ear = (left_ear + right_ear) / 2.0
         mar = self._mouth_aspect_ratio(landmarks, width, height)
 
-        eye_closed = ear < self.config.ear_threshold
-        mouth_open = mar > self.config.mar_threshold
+        state = self._resolve_eye_mouth_state(
+            frame, landmarks, width, height, ear, mar
+        )
+        eye_closed = state["eye_closed"]
+        mouth_open = state["mouth_open"]
 
         if update:
             self._update_counts(eye_closed, mouth_open, ear, mar)
@@ -132,24 +306,59 @@ class LandmarkFatigueTracker:
         window_features = self.window_features
 
         if draw:
-            self._draw_status(frame, landmarks, width, height, ear, mar, eye_closed, mouth_open)
+            self._draw_status(
+                frame,
+                landmarks,
+                width,
+                height,
+                ear,
+                mar,
+                eye_closed,
+                mouth_open,
+                state,
+            )
+
+        if state["detector"] == "pretrained_cnn":
+            eye_state = (
+                f"CNN: {state['eye_closed_probability']:.2f} "
+                f"({'闭合' if eye_closed else '正常'})"
+            )
+            mouth_state = (
+                f"CNN: {state['mouth_open_probability']:.2f} "
+                f"({'张开' if mouth_open else '闭合'})"
+            )
+        else:
+            eye_state = f"EAR: {ear:.2f} ({'闭合' if eye_closed else '正常'})"
+            mouth_state = f"MAR: {mar:.2f} ({'张开' if mouth_open else '闭合'})"
 
         return {
             "face_found": True,
             "eye_closed": eye_closed,
             "mouth_open": mouth_open,
-            "eye_state": f"EAR: {ear:.2f} ({'闭合' if eye_closed else '正常'})",
-            "mouth_state": f"MAR: {mar:.2f} ({'张开' if mouth_open else '闭合'})",
+            "eye_state": eye_state,
+            "mouth_state": mouth_state,
             "ear": ear,
             "mar": mar,
+            "eye_closed_probability": state["eye_closed_probability"],
+            "mouth_open_probability": state["mouth_open_probability"],
+            "model_latency_ms": state["model_latency_ms"],
+            "detector": state["detector"],
             "perclos": window_features["perclos"],
             "blink_count": self.blink_count,
             "blink_rate": window_features["blink_rate"],
             "yawn_count": window_features["yawn_count"],
             "window_features": window_features,
             "fatigue_features": [
-                f"EAR={ear:.2f}",
-                f"MAR={mar:.2f}",
+                (
+                    f"EyeCNN={state['eye_closed_probability']:.2f}"
+                    if state["eye_closed_probability"] is not None
+                    else f"EAR={ear:.2f}"
+                ),
+                (
+                    f"MouthCNN={state['mouth_open_probability']:.2f}"
+                    if state["mouth_open_probability"] is not None
+                    else f"MAR={mar:.2f}"
+                ),
                 f"PERCLOS={window_features['perclos']:.2f}",
                 f"LongestEyeClose={window_features['longest_eye_closure']:.1f}s",
                 f"YawnDuration={window_features['max_yawn_duration']:.1f}s",
@@ -277,7 +486,18 @@ class LandmarkFatigueTracker:
     def _current_duration(start_time):
         return 0.0 if start_time is None else time.time() - start_time
 
-    def _draw_status(self, frame, landmarks, width, height, ear, mar, eye_closed, mouth_open):
+    def _draw_status(
+        self,
+        frame,
+        landmarks,
+        width,
+        height,
+        ear,
+        mar,
+        eye_closed,
+        mouth_open,
+        state,
+    ):
         for idx in self.LEFT_EYE + self.RIGHT_EYE + self.MOUTH_HORIZONTAL:
             point = self._point(landmarks, idx, width, height).astype(int)
             cv2.circle(frame, tuple(point), 2, (0, 255, 255), -1)
@@ -288,8 +508,14 @@ class LandmarkFatigueTracker:
 
         eye_color = (0, 0, 255) if eye_closed else (0, 220, 0)
         mouth_color = (0, 0, 255) if mouth_open else (0, 220, 0)
-        cv2.putText(frame, f"EAR {ear:.2f}", (18, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.7, eye_color, 2)
-        cv2.putText(frame, f"MAR {mar:.2f}", (18, 62), cv2.FONT_HERSHEY_SIMPLEX, 0.7, mouth_color, 2)
+        if state["detector"] == "pretrained_cnn":
+            eye_label = f"Eye CNN {state['eye_closed_probability']:.2f}"
+            mouth_label = f"Mouth CNN {state['mouth_open_probability']:.2f}"
+        else:
+            eye_label = f"EAR {ear:.2f}"
+            mouth_label = f"MAR {mar:.2f}"
+        cv2.putText(frame, eye_label, (18, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.7, eye_color, 2)
+        cv2.putText(frame, mouth_label, (18, 62), cv2.FONT_HERSHEY_SIMPLEX, 0.7, mouth_color, 2)
         features = self.window_features
         cv2.putText(frame, f"PERCLOS {features['perclos']:.2f}", (18, 92), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
         cv2.putText(frame, f"Close {features['longest_eye_closure']:.1f}s", (18, 122), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)

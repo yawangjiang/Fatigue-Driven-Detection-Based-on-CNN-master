@@ -9,6 +9,7 @@ architecture, preprocessing values, class semantics, or eye/mouth crop
 geometry from FatigueSense:
 
 - `pretrained_eye_mouth.py`
+- `fatigue_landmark_detector.py`
 - `tools/validate_pretrained_eye_mouth.py`
 
 The checkpoint files identified in `docs/PRETRAINED_MODEL_VALIDATION.md` are

@@ -1,6 +1,5 @@
 import hashlib
 from pathlib import Path
-import tempfile
 import unittest
 
 import torch
@@ -39,16 +38,13 @@ class EyeMouthProbabilitiesTest(unittest.TestCase):
 
 class CheckpointVerificationTest(unittest.TestCase):
     def test_accepts_expected_digest_and_rejects_wrong_digest(self):
-        payload = b"known checkpoint content"
-        expected = hashlib.sha256(payload).hexdigest()
-        with tempfile.TemporaryDirectory() as directory:
-            checkpoint = Path(directory) / "model.pt"
-            checkpoint.write_bytes(payload)
+        checkpoint = Path(__file__).resolve()
+        expected = hashlib.sha256(checkpoint.read_bytes()).hexdigest()
 
-            self.assertEqual(sha256_file(checkpoint), expected)
-            self.assertEqual(verify_checkpoint(checkpoint, expected), checkpoint)
-            with self.assertRaisesRegex(ValueError, "hash mismatch"):
-                verify_checkpoint(checkpoint, "0" * 64)
+        self.assertEqual(sha256_file(checkpoint), expected)
+        self.assertEqual(verify_checkpoint(checkpoint, expected), checkpoint)
+        with self.assertRaisesRegex(ValueError, "hash mismatch"):
+            verify_checkpoint(checkpoint, "0" * 64)
 
 
 class BinaryROIClassifierTest(unittest.TestCase):

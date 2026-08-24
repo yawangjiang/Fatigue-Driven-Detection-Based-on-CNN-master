@@ -19,6 +19,7 @@ import utils
 from sigjiansuobasic import find_most_similar
 from detection import *
 from fatigue_landmark_detector import LandmarkFatigueTracker
+from pretrained_eye_mouth import PretrainedEyeMouthClassifier
 # import pyttsx3
 import matplotlib
 matplotlib.use('Agg')
@@ -34,6 +35,8 @@ class ModelRepository:
     _ssd_model = None
     _face_model = None
     _face_detector = None
+    _eye_mouth_classifier = None
+    _eye_mouth_classifier_key = None
 
     @classmethod
     def ssd_model(cls):
@@ -69,6 +72,25 @@ class ModelRepository:
                     os.path.join(ROOT, "res10_300x300_ssd_iter_140000.caffemodel"))
             return cls._face_detector
 
+    @classmethod
+    def eye_mouth_classifier(cls, eye_weights, mouth_weights, model_device="cpu"):
+        key = (
+            os.path.abspath(eye_weights),
+            os.path.abspath(mouth_weights),
+            model_device,
+        )
+        with QMutexLocker(cls._mutex):
+            if cls._eye_mouth_classifier is None:
+                cls._eye_mouth_classifier = PretrainedEyeMouthClassifier(
+                    eye_weights=key[0],
+                    mouth_weights=key[1],
+                    device=model_device,
+                )
+                cls._eye_mouth_classifier_key = key
+            elif cls._eye_mouth_classifier_key != key:
+                raise RuntimeError("眼嘴模型已使用不同的权重路径初始化")
+            return cls._eye_mouth_classifier
+
 
 def init_tts_engine():
     return None  # <--- 新增这一行！直接跳过语音引擎初始化
@@ -86,9 +108,42 @@ def init_model():
     return ModelRepository.face_model()
 
 
+def init_eye_mouth_classifier():
+    eye_weights = os.environ.get(
+        "FATIGUE_EYE_WEIGHTS",
+        os.path.join(ROOT, "weights", "best_eye_classifier.pt"),
+    )
+    mouth_weights = os.environ.get(
+        "FATIGUE_MOUTH_WEIGHTS",
+        os.path.join(ROOT, "weights", "best_mouth_classifier.pt"),
+    )
+    model_device = os.environ.get("FATIGUE_MODEL_DEVICE", "cpu")
+
+    if not os.path.isfile(eye_weights) or not os.path.isfile(mouth_weights):
+        print(
+            "未配置预训练眼嘴模型，使用EAR/MAR。请设置 "
+            "FATIGUE_EYE_WEIGHTS 和 FATIGUE_MOUTH_WEIGHTS。"
+        )
+        return None
+
+    try:
+        classifier = ModelRepository.eye_mouth_classifier(
+            eye_weights,
+            mouth_weights,
+            model_device,
+        )
+        print(f"预训练眼嘴模型已加载: {model_device}")
+        return classifier
+    except Exception as exc:
+        print(f"预训练眼嘴模型加载失败，使用EAR/MAR: {exc}")
+        return None
+
+
 def init_landmark_tracker():
     try:
-        return LandmarkFatigueTracker()
+        return LandmarkFatigueTracker(
+            state_classifier=init_eye_mouth_classifier()
+        )
     except Exception as exc:
         print(f"关键点疲劳检测初始化失败，回退到SSD检测: {exc}")
         return None
@@ -272,7 +327,10 @@ class ContinuousFatigueDetectionThread(BaseDetectionThread):
                         "fatigue_features": landmark_status["fatigue_features"],
                         "ear": landmark_status["ear"],
                         "mar": landmark_status["mar"],
-                        "detector": "landmark",
+                        "eye_closed_probability": landmark_status.get("eye_closed_probability"),
+                        "mouth_open_probability": landmark_status.get("mouth_open_probability"),
+                        "model_latency_ms": landmark_status.get("model_latency_ms"),
+                        "detector": landmark_status.get("detector", "landmark_rule"),
                     }
                     if result['fatigue']:
                         img = self.cv2_add_chinese_text(img, "疲劳警告!", (50, 120), (0, 0, 255), 30)
@@ -289,7 +347,7 @@ class ContinuousFatigueDetectionThread(BaseDetectionThread):
                     "eye_state": landmark_status["eye_state"],
                     "mouth_state": landmark_status["mouth_state"],
                     "fatigue_features": ["未检测到人脸"],
-                    "detector": "landmark",
+                    "detector": landmark_status.get("detector", "landmark_rule"),
                 }
             except Exception as exc:
                 print(f"关键点疲劳检测失败，回退到SSD检测: {exc}")
@@ -1031,7 +1089,10 @@ class FatigueCheckInThread(BaseDetectionThread):
                     "confidence": best_confidence,
                     "detected_faces": detected_faces[:3] if detected_faces else [""],
                     "fatigue_features": landmark_status.get("fatigue_features", ["未检测到疲劳特征"]),
-                    "detector": "landmark",
+                    "eye_closed_probability": landmark_status.get("eye_closed_probability"),
+                    "mouth_open_probability": landmark_status.get("mouth_open_probability"),
+                    "model_latency_ms": landmark_status.get("model_latency_ms"),
+                    "detector": landmark_status.get("detector", "landmark_rule"),
                 }
                 return img, status_info
             except Exception as exc:

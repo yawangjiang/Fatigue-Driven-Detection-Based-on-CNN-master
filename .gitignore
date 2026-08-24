@@ -4,6 +4,7 @@ __pycache__/
 
 .venv/
 .idea/
+fatigue_models.local.bat
 
 *.pth
 *.pt
